@@ -102,6 +102,17 @@ body {
   right: -80px;
 }
 
+.random-button {
+  margin-top: 20px;
+  padding: 10px 20px;
+  background: var(--gold);
+  border: none;
+  color: white;
+  cursor: pointer;
+  font-size: 18px;
+  border-radius: 5px;
+}
+
 .upload-area {
   margin-top: 20px;
   padding: 20px;
@@ -119,9 +130,15 @@ h1 {
   color: var(--gold);
   text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
 }
+
+.canvas-container {
+  display: none;
+}
 </style>
 <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/gun/gun.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.11.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/nsfwjs@2.4.0/dist/nsfwjs.min.js"></script>
 </head>
 <body>
 <h1>The Gallery</h1>
@@ -140,19 +157,40 @@ h1 {
   <button class="nav-button next">→</button>
 </div>
 
+<button class="random-button">Show Random Image</button>
+
 <div class="upload-area" id="uploadArea">
   <p>Drag and drop your image here or click to select</p>
   <input type="file" id="fileInput" accept="image/*" style="display: none">
 </div>
 
+<div class="canvas-container">
+  <canvas id="canvas"></canvas>
+</div>
+
 <script>
-// Initialize GUN
+// Initialize GUN with multiple peers for redundancy
 const gun = Gun({
-  peers: ['https://gun-manhattan.herokuapp.com/gun'] // You might want to add more peers
+  peers: [
+    'https://gun-manhattan.herokuapp.com/gun',
+    'https://gun-us.herokuapp.com/gun',
+    'https://gun-eu.herokuapp.com/gun'
+  ]
 });
 
 let currentImages = [];
 let currentIndex = 0;
+let nsfwModel = null;
+
+// Load NSFW detection model
+(async () => {
+  try {
+    nsfwModel = await nsfwjs.load();
+    console.log('NSFW model loaded successfully');
+  } catch (error) {
+    console.error('Error loading NSFW model:', error);
+  }
+})();
 
 // Initialize GUN data
 const images = gun.get('gallery-images');
@@ -160,7 +198,7 @@ const images = gun.get('gallery-images');
 // Load images from GUN
 images.map().once((data, id) => {
   if (data && data.url) {
-    currentImages.push(data.url);
+    currentImages.push({url: data.url, id: id});
     if (currentImages.length === 1) {
       document.getElementById('currentImage').src = data.url;
     }
@@ -171,18 +209,27 @@ images.map().once((data, id) => {
 document.querySelector('.prev').addEventListener('click', () => {
   if (currentImages.length === 0) return;
   currentIndex = (currentIndex - 1 + currentImages.length) % currentImages.length;
-  document.getElementById('currentImage').src = currentImages[currentIndex];
+  document.getElementById('currentImage').src = currentImages[currentIndex].url;
 });
 
 document.querySelector('.next').addEventListener('click', () => {
   if (currentImages.length === 0) return;
   currentIndex = (currentIndex + 1) % currentImages.length;
-  document.getElementById('currentImage').src = currentImages[currentIndex];
+  document.getElementById('currentImage').src = currentImages[currentIndex].url;
+});
+
+// Random image function
+document.querySelector('.random-button').addEventListener('click', () => {
+  if (currentImages.length === 0) return;
+  currentIndex = Math.floor(Math.random() * currentImages.length);
+  document.getElementById('currentImage').src = currentImages[currentIndex].url;
 });
 
 // File upload handling
 const uploadArea = document.getElementById('uploadArea');
 const fileInput = document.getElementById('fileInput');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
 
 uploadArea.addEventListener('click', () => fileInput.click());
 
@@ -205,26 +252,77 @@ fileInput.addEventListener('change', (e) => {
   handleFiles(e.target.files);
 });
 
-function handleFiles(files) {
+async function checkNSFW(img) {
+  if (!nsfwModel) {
+    console.log('NSFW model not loaded yet');
+    return false;
+  }
+  try {
+    const predictions = await nsfwModel.classify(img);
+    for (let prediction of predictions) {
+      if (prediction.className !== 'Drawing' && prediction.className !== 'Neutral' && prediction.probability > 0.7) {
+        return true;
+      }
+    }
+    return false;
+  } catch (error) {
+    console.error('Error checking NSFW:', error);
+    return false;
+  }
+}
+
+async function handleFiles(files) {
   const file = files[0];
   if (!file || !file.type.startsWith('image/')) return;
 
+  const img = new Image();
   const reader = new FileReader();
-  reader.onload = (e) => {
-    const imageUrl = e.target.result;
-    
-    // Save to GUN
-    images.set({
-      url: imageUrl,
-      timestamp: Date.now()
-    });
 
-    // Add to local array and display
-    currentImages.push(imageUrl);
-    currentIndex = currentImages.length - 1;
-    document.getElementById('currentImage').src = imageUrl;
+  reader.onload = async (e) => {
+    img.src = e.target.result;
+    img.onload = async () => {
+      try {
+        // Check for NSFW content
+        const isNSFW = await checkNSFW(img);
+        
+        if (isNSFW) {
+          alert('This image has been detected as inappropriate and cannot be uploaded.');
+          return;
+        }
+
+        // Setup canvas for potential image processing
+        canvas.width = img.width;
+        canvas.height = img.height;
+        ctx.drawImage(img, 0, 0);
+        
+        const processedImageUrl = canvas.toDataURL(file.type);
+
+        // Save to GUN with unique timestamp-based ID
+        const timestamp = Date.now();
+        images.get(`${timestamp}`).put({
+          url: processedImageUrl,
+          timestamp: timestamp
+        });
+
+        // Add to local array and display
+        currentImages.push({url: processedImageUrl, id: `${timestamp}`});
+        currentIndex = currentImages.length - 1;
+        document.getElementById('currentImage').src = processedImageUrl;
+      } catch (error) {
+        console.error('Error processing image:', error);
+        alert('Error processing image. Please try again.');
+      }
+    };
   };
   reader.readAsDataURL(file);
 }
+
+// Initialize with a random image if available
+setTimeout(() => {
+  if (currentImages.length > 0) {
+    currentIndex = Math.floor(Math.random() * currentImages.length);
+    document.getElementById('currentImage').src = currentImages[currentIndex].url;
+  }
+}, 1000);
 </script>
 </body></html>
